@@ -2,15 +2,20 @@ import requests
 import json
 import operator
 from redis import StrictRedis
+from celery import Celery
 from flask import Flask, make_response
 
 
 DISCUSSION_API = 'http://discussionapi.guardian.co.uk/discussion-api/'
 CONTENT_API = 'http://content.guardianapis.com/'
-RESPONSE_CACHE_TIME = 30 # in seconds
+CACHE_DATA_FOR = 60 * 60 * 6 # seconds
+BROKER_URL = 'redis://'
+CELERY_RESULT_BACKEND = 'redis://'
+
 
 app = Flask(__name__)
 redis = StrictRedis('localhost', 6379)
+celery = Celery('app')
 
 
 @app.route('/comments/latest/<userid>')
@@ -20,16 +25,17 @@ def latest_comments(userid):
     if cached_data:
         response = make_response(cached_data)
     else:
-        data = get_user_comments(userid)
-        response = make_response(data)
+        get_user_comments.delay(userid)
+        response = make_response(json.dumps({}))
     response.mimetype = 'application/json'
     return response
 
 
+@celery.task(name='get-user-comments')
 def get_user_comments(userid):
     """Build a map of recent comment counts by section"""
     r = requests.get(
-        '{}profile/{}/comments?pageSize=500'.format(DISCUSSION_API, userid)
+        '{}profile/{}/comments?pageSize=50'.format(DISCUSSION_API, userid)
     )
 
     # If call failed, swallow the error and return no data
@@ -54,9 +60,13 @@ def get_user_comments(userid):
     for key, count in comments:
         if not key in key_sections.keys():
             r = requests.get('{}{}'.format(CONTENT_API, key[1:]))
-            section = json.loads(r.content)['response']['content']['sectionId']
-            redis.hset('da/key-sections', key, section)
-            key_sections[key] = section
+            try:
+                content = json.loads(r.content)
+                section = content['response']['content']['sectionId']
+                redis.hset('da/key-sections', key, section)
+                key_sections[key] = section
+            except ValueError:
+                del comments[key] # couldn't lookup section, so ignore it
 
     # Map comments to sections
     comments_sections = {}
@@ -71,7 +81,7 @@ def get_user_comments(userid):
     data = json.dumps(comments_sections)
     pipe = redis.pipeline()
     pipe.set(rkey, data)
-    pipe.expire(rkey, RESPONSE_CACHE_TIME)
+    pipe.expire(rkey, CACHE_DATA_FOR)
     pipe.execute()
 
     return data
